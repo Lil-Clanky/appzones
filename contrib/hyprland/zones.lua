@@ -1,4 +1,7 @@
--- zones.lua: mark every window by the app zone its process runs in
+-- zones.lua: the pre-0.6 name of appzones.lua, kept so a Hyprland config
+-- that loads it keeps working; point it at appzones.lua instead. A full copy,
+-- not a loader: Nix may copy this file into the store on its own. Removed in
+-- a later release; test_zonecfg checks the copy matches appzones.lua.
 -- (appzones docs/guide.md "Hyprland"; tested in tests/vm.nix).
 --
 -- The zone comes from the host-side cgroup of the window's pid
@@ -9,14 +12,14 @@
 -- zone's border colour, and no_shortcuts_inhibit (zone clients can see
 -- zwp_keyboard_shortcuts_inhibit_manager_v1; they never switch off the
 -- compositor's shortcuts).
--- Colours: $XDG_RUNTIME_DIR/zones/colours, "NAME #rrggbb" lines written by
+-- Colours: $XDG_RUNTIME_DIR/appzones/colours, "NAME #rrggbb" lines written by
 -- `appzones` at every zone start and login.
 local rt = os.getenv("XDG_RUNTIME_DIR") or "/run/user/1000"
 local fallback = "rgb(f38ba8)"
 
 local function colours()
 	local t = {}
-	local f = io.open(rt .. "/zones/colours", "r")
+	local f = io.open(rt .. "/appzones/colours", "r")
 	if not f then
 		return t
 	end

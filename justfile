@@ -26,6 +26,22 @@ demo:
     install -m 644 result-demo/* docs/
     rm result-demo
 
+# Tag VERSION on origin/main (as fetched now) and publish a GitHub release with its CHANGELOG section as the notes
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch -q origin
+    sha=$(git rev-parse origin/main)  # one commit for every check, the prompt and the tag
+    grep -q 'version = "{{version}}";' <(git show "$sha":nix/package.nix) \
+        || { echo "nix/package.nix at ${sha:0:7} is not {{version}}"; exit 1; }
+    notes=$(git show "$sha":CHANGELOG.md | awk '/^## {{version}}$/ {on=1; next} /^## / {on=0} on')
+    [ -n "$(echo "$notes" | tr -d '[:space:]')" ] || { echo "no '## {{version}}' section in CHANGELOG.md at ${sha:0:7}"; exit 1; }
+    ! git ls-remote --exit-code --tags origin "v{{version}}" >/dev/null || { echo "v{{version}} exists already"; exit 1; }
+    echo "$notes"
+    read -rp "Publish v{{version}} on ${sha:0:7} with these notes? [y/N] " ok
+    [ "$ok" = y ] || exit 1
+    gh release create "v{{version}}" --target "$sha" --title "appzones {{version}}" --notes "$notes"
+
 # Format the Nix files
 fmt:
     nix fmt
