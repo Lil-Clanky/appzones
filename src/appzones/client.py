@@ -27,22 +27,163 @@ def up(name: str, quiet: bool = False) -> None:
     if agent.ping(name):
         return
     load_zone(name)
-    if use_systemd():
-        if not quiet:
-            warn(f"starting zone {name}")
-        r = systemctl("start", f"appzones@{name}.service", check=False)
-        if r.returncode != 0:
-            die(f"zone {name} failed to start; see `appzones logs {name}`\n{r.stderr.strip()}")
-    else:
-        common.RT.mkdir(parents=True, exist_ok=True)
-        log = open(common.RT / f"{name}.log", "ab")
-        subprocess.Popen([sys.executable, str(common.HERE / "zone.py"), "serve", name], stdout=log, stderr=log,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+    if not use_systemd():
+        spawn(name, quiet)
+        return
+    if not quiet:
+        warn(f"starting zone {name}")
+    r = systemctl("start", f"appzones@{name}.service", check=False)
+    if r.returncode != 0:
+        die(f"zone {name} failed to start; see `appzones logs {name}`\n{r.stderr.strip()}")
     for _ in range(200):
         if agent.ping(name):
             return
         time.sleep(0.05)
     die(f"zone {name} did not answer within 10 s; see `appzones logs {name}`")
+
+
+def _log_tail(name: str, lines: int = 15, since: int = 0) -> str:
+    """The last LINES of the zone's log written after offset SINCE, from a bounded read."""
+    try:
+        with open(common.log_path(name), "rb") as f:
+            f.seek(max(since, f.seek(0, os.SEEK_END) - 16384))
+            text = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join("  " + l for l in text.splitlines()[-lines:])
+
+
+def _open_log(name: str) -> int:
+    """The zone's log for a server we start: appended, rotated once at start when big."""
+    common.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = common.log_path(name)
+    try:
+        if path.stat().st_size > common.LOG_MAX:
+            path.replace(path.with_name(path.name + ".1"))
+    except FileNotFoundError:
+        pass
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+
+
+def _start_server(name: str, lock: int) -> tuple[int, int]:
+    """Start `appzones serve NAME` detached (its own session, cwd /, stdin /dev/null, the
+    log for output), handing it the LOCK we hold and a readiness pipe; returns the pipe's
+    read end and where this attempt's output starts in the log. A client killed after
+    this does not stop the server."""
+    if not zonecfg.NAME_RE.fullmatch(name):
+        die(f"not a zone name: {name!r}")
+    try:
+        log = _open_log(name)
+    except OSError as e:
+        die(f"zone {name}: cannot open its log {common.log_path(name)}: {e.strerror or e}")
+    since = os.fstat(log).st_size  # after a rotation, under the lock, before the server writes
+    try:
+        r, w = os.pipe()
+    except OSError as e:
+        os.close(log)
+        die(f"zone {name}: could not start its server: {e.strerror or e}")
+    env = {k: v for k, v in os.environ.items() if k not in ("NOTIFY_SOCKET", "LISTEN_FDS", "LISTEN_PID")}
+    # the server runs in /: the config and state it reads must not be relative paths
+    env["APPZONES_CONFIG"] = str(Path(common.CONFIG).absolute())
+    env.pop("ZONES_CONFIG", None)
+    for key in ("STATE", "DENIED_PATHS"):
+        v = zonecfg.env(key)
+        if v:
+            env[f"APPZONES_{key}"] = str(Path(v).absolute())
+            env.pop(f"ZONES_{key}", None)
+    argv = [sys.executable, "-B", str(common.HERE / "zone.py"), "serve", name, "--lock-fd", str(lock),
+            "--notify-fd", str(w)]
+    try:
+        pid = os.fork()
+    except OSError as e:
+        pid, err = -1, e
+    if pid == 0:  # the intermediate: start the server in a new session, then go
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd="/", env=env,
+                             pass_fds=(lock, w), start_new_session=True)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.close(w)
+    os.close(log)
+    if pid < 0:
+        os.close(r)
+        die(f"zone {name}: could not start its server: {err.strerror or err}")
+    _, status = os.waitpid(pid, 0)
+    if os.waitstatus_to_exitcode(status) != 0:
+        os.close(r)
+        die(f"zone {name}: could not start its server")
+    return r, since
+
+
+def spawn(name: str, quiet: bool = False) -> None:
+    """Without systemd: start zone NAME's server ourselves, or wait for the one that is
+    starting. The zone's lock decides who starts it: exactly one server per zone."""
+    started = claim(name, quiet)
+    if started is not None:
+        wait_ready(name, *started, quiet=quiet)
+
+
+def claim(name: str, quiet: bool = False, wait: bool = True) -> tuple[int, int] | None:
+    """Start zone NAME's server if nobody runs or starts it: its readiness pipe and log
+    offset (see _start_server), or None
+    when the zone answers (or, with WAIT, once it does; without WAIT, at once when
+    someone else is starting it)."""
+    path = server.lock_path(name)
+    common.RT.mkdir(parents=True, exist_ok=True)
+    os.chmod(common.RT, 0o700)
+    started = time.monotonic()
+    waited_note = False
+    while True:
+        if agent.ping(name):
+            return None
+        lock = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock)  # someone else starts it, or runs it: wait for it to answer
+            if not wait:
+                return None
+            if time.monotonic() - started > 2 * server.START_TIMEOUT:
+                pids = server_pids(name)
+                die(f"zone {name} is held by a server" + (f" (pid {', '.join(map(str, pids))})" if pids else "")
+                    + f" but does not answer; see `appzones logs {name}`")
+            if not waited_note and not quiet and time.monotonic() - started > 2:
+                warn(f"waiting for zone {name} to start")
+                waited_note = True
+            time.sleep(0.1)
+            continue
+        if agent.ping(name):  # answered in between (an older server without a lock)
+            os.close(lock)
+            return None
+        break
+    if not quiet:
+        warn(f"starting zone {name}")
+    try:
+        return _start_server(name, lock)
+    finally:
+        os.close(lock)  # the server holds it now
+
+
+def wait_ready(name: str, r: int, since: int = 0, quiet: bool = False) -> None:
+    """Until zone NAME's server signals readiness on R; dies with the end of its log (from
+    offset SINCE: this attempt) when it ended first. No total limit: the server has
+    per-step deadlines, packages may build."""
+    try:
+        note = time.monotonic() + 3
+        poll = select.poll()
+        poll.register(r, select.POLLIN)
+        while True:
+            ready = poll.poll(1000)
+            if ready:
+                if os.read(r, 1) == b"\n":
+                    return
+                die(f"zone {name} did not start; the end of its log ({common.log_path(name)}):\n{_log_tail(name, since=since)}")
+            if not quiet and note and time.monotonic() > note:
+                warn(f"zone {name} is still starting (Ctrl-C leaves it starting; log: {common.log_path(name)})")
+                note = 0
+    finally:
+        os.close(r)
 
 
 def stale(name: str, z: zonecfg.Zone) -> bool:
@@ -529,12 +670,28 @@ def apps() -> int:
 
 def autostart() -> int:
     cfg = load_cfg(quiet=True)
+    starting: list[tuple[str, int, int]] = []
     server.write_colours(cfg)
     apps()
     for n, z in cfg.zones.items():
         if z.settings["autostart"]:
             print(f"autostart: zone {n}")
-            systemctl("start", "--no-block", f"appzones@{n}.service", check=False)
+            if use_systemd():
+                systemctl("start", "--no-block", f"appzones@{n}.service", check=False)
+            else:
+                try:  # start them all first: a slow one (packages) holds up no other
+                    started = claim(n, quiet=True, wait=False)
+                    if started is not None:
+                        starting.append((n, *started))
+                except SystemExit:
+                    pass  # said why; the other zones still start
+                except OSError as e:
+                    warn(f"autostart: zone {n}: {e.strerror or e}")
+    for n, r, since in starting:
+        try:
+            wait_ready(n, r, since, quiet=True)
+        except SystemExit:
+            pass
     return 0
 
 
@@ -578,6 +735,6 @@ def active(follow: bool, as_json: bool) -> int:
 def logs(name: str, follow: bool) -> int:
     load_zone(name)
     if not use_systemd():
-        os.execvp("tail", ["tail", "-n", "200", *(["-F"] if follow else []), str(common.RT / f"{name}.log")])
+        os.execvp("tail", ["tail", "-n", "200", *(["-F"] if follow else []), str(common.log_path(name))])
     os.execvp("journalctl", ["journalctl", "--user", "-u", f"appzones@{name}.service", "-n", "200", "--no-pager",
                              *(["-f"] if follow else [])])

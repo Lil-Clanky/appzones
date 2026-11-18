@@ -1010,5 +1010,51 @@ pkgs.testers.runNixOSTest {
             print(f"PASS  kill -9 of {z}'s server ({when}): zone-init, bwrap, pasta, the proxy and zone-wayland are gone")
             u(f"appzones up {z} && appzones ping {z} && appzones stop {z}")
             print(f"PASS  {z} starts again at once (the lock went with the killed server)")
+
+    with subtest("start on demand without systemd"):
+        S = "APPZONES_SUPERVISOR=none "
+
+        def servers(z):
+            return int(machine.succeed(f"pgrep -u alice -fc 'zone.py serve {z}( |$)' || true").strip() or 0)
+
+        # a stale agent socket (no one listening) does not get in the way
+        u("mkdir -p /run/user/1000/appzones/tb && rm -f /run/user/1000/appzones/tb/agent.sock && ${pkgs.python3}/bin/python3 -c "
+          "'import socket; socket.socket(socket.AF_UNIX).bind(\"/run/user/1000/appzones/tb/agent.sock\")'")
+        u("test -S /run/user/1000/appzones/tb/agent.sock && ! appzones ping tb")
+        u(S + "appzones run --wait tb -- true </dev/null 2>&1")
+        u("appzones ping tb && ! systemctl --user is-active appzones@tb.service && test -s ~/.local/state/appzones/tb.log")
+        assert servers("tb") == 1
+        print("PASS  run starts a stopped zone itself: one server, no unit, its log in ~/.local/state/appzones")
+        u(S + "appzones stop tb && ! appzones ping tb")
+        assert servers("tb") == 0
+        u("pids=; for i in $(seq 10); do " + S + "appzones run --wait tb -- true </dev/null >/dev/null 2>&1 & pids=\"$pids $!\"; done; "
+          "for p in $pids; do wait $p || exit 1; done")
+        assert servers("tb") == 1, servers("tb")
+        print("PASS  ten runs at once on a stopped zone: all ran, exactly one server")
+        u(S + "appzones stop tb")
+        # a client killed before the zone is ready: zone-wayland made slow, so the start
+        # is still going on when the client dies; the server finishes it
+        zw = machine.succeed("ls /nix/store/*-zone-wayland*/bin/zone-wayland | head -1").strip()
+        machine.succeed(f"printf '#!/bin/sh\\nsleep 4\\nexec {zw} \"$@\"\\n' >/tmp/slow-zw && chmod 755 /tmp/slow-zw")
+        u("systemd-run --user --collect --unit=client-tb -p KillMode=process "
+          "-E APPZONES_SUPERVISOR=none -E APPZONES_BIN_ZONE_WAYLAND=/tmp/slow-zw $(readlink -f $(command -v appzones)) up tb")
+        machine.wait_until_succeeds("pgrep -u alice -f 'zone.py serve tb '", timeout=30)
+        u("! appzones ping tb")
+        u("systemctl --user kill --kill-whom=main -s KILL client-tb")
+        machine.wait_until_fails("su -l alice -c " + shlex.quote(ENV + "systemctl --user is-active client-tb"), timeout=30)
+        machine.wait_until_succeeds("su -l alice -c " + shlex.quote(ENV + "appzones ping tb"), timeout=60)
+        assert servers("tb") == 1
+        print("PASS  a client killed before the zone was ready: the server finishes the start; one server")
+        # the python running zone_init.py (bwrap's own command line names it too)
+        init = machine.succeed("pgrep -u alice -f '^[^ ]*python[^ ]* [^ ]*zone_init.py'").split()
+        assert len(init) == 1, init
+        machine.succeed(f"kill -STOP {init[0]}")
+        rc, out = u(S + "appzones up tb 2>&1", check=False)
+        print(out)
+        assert rc != 0 and "does not answer" in out, (rc, out)
+        assert servers("tb") == 1
+        machine.succeed(f"kill -CONT {init[0]}")
+        print("PASS  a stuck zone: the client reports it, no second server")
+        u(S + "appzones stop tb && ! appzones ping tb")
   '';
 }
