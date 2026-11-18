@@ -415,7 +415,13 @@ def busy(path):
 
 
 def handle(conn: socket.socket):
-    data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
+    conn.settimeout(5)  # a client that connects and says nothing cannot hold zone-init up
+    try:
+        data, fds, _, _ = socket.recv_fds(conn, 65536, 3)
+    except (TimeoutError, OSError):
+        conn.close()
+        return
+    conn.settimeout(None)
     try:
         req = json.loads(data.decode().splitlines()[0])
     except (ValueError, IndexError):
@@ -559,9 +565,22 @@ def listener() -> socket.socket:
     return socket.socket(fileno=fd)
 
 
+def server_watch() -> int:
+    """The pidfd of this zone's server ($ZONE_SERVER_FD, from the host): it becomes
+    readable when the server exits, and then the zone ends too."""
+    raw = os.environ.pop("ZONE_SERVER_FD", "")
+    if not raw.isdigit():
+        log("no $ZONE_SERVER_FD from the host; refusing to run")
+        sys.exit(1)
+    fd = int(raw)
+    os.set_inheritable(fd, False)  # never into an app
+    return fd
+
+
 def main():
     harden_self()
     srv = listener()
+    server = server_watch()
     r, w = os.pipe()
     os.set_blocking(w, False)
     signal.set_wakeup_fd(w)
@@ -569,6 +588,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     sel.register(srv, selectors.EVENT_READ, ("srv", 0))
     sel.register(r, selectors.EVENT_READ, ("sig", 0))
+    sel.register(server, selectors.EVENT_READ, ("server", 0))
     log(f"zone {ZONE} ready (control socket: fd from the host)")
     while True:
         for key, _ in sel.select():
@@ -583,6 +603,10 @@ def main():
             elif kind == "sig":
                 os.read(r, 512)
                 reap()
+            elif kind == "server":
+                # the server is gone: no one reads our log now, and a blocked write
+                # must not keep the zone alive; end it at once
+                os._exit(0)
             elif kind == "out":
                 if pid in outputs:
                     read_output(pid)

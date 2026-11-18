@@ -9,6 +9,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,9 @@ def notify_ready(name: str, notify_fd: int | None) -> None:
                 pass
 
 
+# the limit for each startup step (zone-wayland ready, the bus, zone-init answering);
+# `packages` are built before any of them, without a limit
+START_TIMEOUT = 30.0
 ALREADY_SERVED = 75  # exit status of a second server for a zone (the unit does not restart on it)
 
 
@@ -178,20 +182,21 @@ def supervise(name: str, notify_fd: int | None = None, lock_fd: int | None = Non
     signal.signal(signal.SIGINT, stop_all)
     if os.environ.get("WAYLAND_DISPLAY"):
         h = subprocess.Popen([tool("zone-wayland"), str(zrt / "wayland-0"), f"dev.mirql.zone.{name}", instance],
-                             stdout=subprocess.PIPE, text=True)
+                             stdout=subprocess.PIPE,
+                             env=dict(os.environ, ZONE_WAYLAND_PARENT=str(os.getpid())))
         helpers.append(h)
-        if h.stdout.readline().strip() != "ready":
-            stop_all(); die("zone-wayland did not become ready")
+        if read_line(h.stdout.fileno(), START_TIMEOUT) != b"ready":
+            stop_all(); die(f"zone-wayland did not become ready within {START_TIMEOUT:.0f} s")
     else:
         print(f"[zone] no WAYLAND_DISPLAY: zone {name} starts without a Wayland socket", flush=True)
     if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        helpers.append(subprocess.Popen(portals.dbus_proxy_argv(z, zrt)))
-        for _ in range(100):
-            if (zrt / "bus").exists():
-                break
+        # its bwrap has --die-with-parent too, but arms it only once running
+        helpers.append(subprocess.Popen(portals.dbus_proxy_argv(z, zrt), preexec_fn=die_with(os.getpid())))
+        end = time.monotonic() + START_TIMEOUT
+        while not (zrt / "bus").exists():
+            if time.monotonic() > end or helpers[-1].poll() is not None:
+                stop_all(); die("xdg-dbus-proxy did not create the zone's bus")
             time.sleep(0.05)
-        else:
-            stop_all(); die("xdg-dbus-proxy did not create the zone's bus")
     network = s["network"]
     (zrt / "nft.rules").write_text(net.nft_rules(z))
     # bwrap writes its info (child-pid) to fd 3; the portal reads it as
@@ -206,15 +211,23 @@ def supervise(name: str, notify_fd: int | None = None, lock_fd: int | None = Non
     if network == "internet":
         argv = net.pasta_argv(z) + argv
     child = subprocess.Popen(argv)
+    if not offer_pidfd(name, child):
+        print(f"[zone] {name}: _netsetup did not take the server's pidfd; stopping", flush=True)
+        stop_all()
+        wait_or_kill(child)
+        shutil.rmtree(fp, ignore_errors=True)
+        return 1
     # ready: zone-init answers; then the autostart apps
-    for _ in range(200):
-        if child.poll() is not None or agent.ping(name):
+    end, answered = time.monotonic() + START_TIMEOUT, False
+    while time.monotonic() < end and child.poll() is None:
+        if agent.ping(name):
+            answered = True
             break
         time.sleep(0.05)
-    if child.poll() is None and not agent.ping(name):
-        print(f"[zone] {name}: zone-init did not answer within 10 s; stopping", flush=True)
+    if child.poll() is None and not answered:
+        print(f"[zone] {name}: zone-init did not answer within {START_TIMEOUT:.0f} s; stopping", flush=True)
         stop_all()
-        child.wait()
+        wait_or_kill(child)
         shutil.rmtree(fp, ignore_errors=True)
         return 1
     if child.poll() is None:
@@ -304,6 +317,103 @@ def agent_listener(name: str) -> int:
     return fd
 
 
+def read_line(fd: int, timeout: float) -> bytes | None:
+    """One line from FD, read whole within TIMEOUT seconds (without its newline); None if not."""
+    end, buf = time.monotonic() + timeout, b""
+    poll = select.poll()  # not select(): any fd number
+    poll.register(fd, select.POLLIN)
+    while b"\n" not in buf:
+        left = end - time.monotonic()
+        if left <= 0 or not poll.poll(int(left * 1000) + 1):
+            return None
+        chunk = os.read(fd, 256)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf.split(b"\n", 1)[0].strip()
+
+
+def die_with(server: int):
+    """A preexec_fn: the child gets SIGKILL when SERVER dies (PR_SET_PDEATHSIG), and exits
+    if it died already. The server is single-threaded, so preexec_fn is safe here."""
+    def arm():
+        import ctypes
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+        if os.getppid() != server:
+            os._exit(1)
+    return arm
+
+
+def wait_or_kill(p: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Wait for P, SIGKILL it when it has not exited after TIMEOUT (e.g. stopped by SIGSTOP)."""
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+
+
+def handoff_path(name: str) -> Path:
+    """Where the server hands its own pidfd to _netsetup (in the zone's runtime dir, 0700)."""
+    return common.RT / name / "srv.sock"  # not longer than agent.sock (unix socket path limit)
+
+
+def offer_pidfd(name: str, child: subprocess.Popen) -> bool:
+    """Give _netsetup a pidfd of this server, over a unix socket: a pid cannot be used
+    there (pasta's namespaces) and an inherited fd cannot get there (pasta closes them),
+    but a passed fd can. zone-init watches it and ends the zone when this process ends.
+    False when _netsetup did not come for it in time or the child exited first."""
+    path = handoff_path(name)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as ls:
+        ls.bind(str(path))
+        ls.listen(1)
+        ls.settimeout(0.2)
+        try:
+            end = time.monotonic() + START_TIMEOUT
+            while time.monotonic() < end and child.poll() is None:
+                try:
+                    conn, _ = ls.accept()
+                except TimeoutError:
+                    continue
+                with conn:
+                    me = os.pidfd_open(os.getpid())
+                    try:
+                        socket.send_fds(conn, [b"pidfd"], [me])
+                    except OSError as e:
+                        print(f"[zone] {name}: handing over the server's pidfd failed: {e.strerror or e}", flush=True)
+                        return False
+                    finally:
+                        os.close(me)
+                return True
+            return False
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def receive_pidfd(name: str) -> int:
+    """_netsetup's side of offer_pidfd: the server's pidfd, for zone-init ($ZONE_SERVER_FD)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(START_TIMEOUT)
+        end = time.monotonic() + START_TIMEOUT
+        while True:
+            try:
+                s.connect(str(handoff_path(name)))
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.monotonic() > end:
+                    die(f"zone {name}: no pidfd from its server; not starting the zone")
+                time.sleep(0.05)
+        uid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
+        msg, fds, _, _ = socket.recv_fds(s, 16, 1)
+    if uid != os.getuid() or msg != b"pidfd" or len(fds) != 1:
+        for f in fds:
+            os.close(f)
+        die(f"zone {name}: no valid pidfd from its server; not starting the zone")
+    os.set_inheritable(fds[0], True)  # for zone-init, through bwrap
+    return fds[0]
+
+
 def netsetup(rules: str, info: str, name: str, argv: list[str]) -> None:
     if rules != "-":
         r = subprocess.run([tool("nft"), "-f", rules])
@@ -315,7 +425,8 @@ def netsetup(rules: str, info: str, name: str, argv: list[str]) -> None:
         os.close(fd)
     os.set_inheritable(3, True)
     ctl = agent_listener(name)
+    srv = receive_pidfd(name)
     i = argv.index("--")
-    argv = argv[:i] + ["--setenv", "ZONE_CTL_FD", str(ctl)] + argv[i:]
+    argv = argv[:i] + ["--setenv", "ZONE_CTL_FD", str(ctl), "--setenv", "ZONE_SERVER_FD", str(srv)] + argv[i:]
     argv = pin_binds(argv)  # after fd 3 and the agent's: pinned descriptors come next
     os.execvp(argv[0], argv)
