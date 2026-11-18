@@ -59,6 +59,7 @@ runCommand "appzones-${version}"
     lib=$out/libexec/appzones
     mkdir -p $lib $out/bin $out/share/appzones
     cp ${src}/zone.py $lib/zone.py
+    cp -r --no-preserve=mode ${src}/appzones $lib/appzones
     cp ${src}/zone_init.py $lib/zone_init.py
     cp ${src}/zonecfg.py $lib/zonecfg.py
     cp ${examples}/zones.toml $out/share/appzones/zones.example.toml
@@ -70,14 +71,15 @@ runCommand "appzones-${version}"
     { echo "#!${python3}/bin/python3 -IB"; cat ${src}/zone_mount_helper.py; } > $lib/appzones-mount-helper
     chmod 555 $lib/appzones-mount-helper
 
-    # unit tests of the validator (and parts of zone.py), against a fake home and sysfs
+    # unit tests of the validator (and parts of the appzones modules), against a fake home and sysfs
     work=$(mktemp -d)
     mkdir -p $work/src $work/examples $work/contrib/hyprland
     cp ${src}/zonecfg.py ${src}/zone.py ${src}/zone_mount_helper.py ${src}/test_zonecfg.py $work/src/
+    cp -r --no-preserve=mode ${src}/appzones $work/src/appzones
     cp ${examples}/*.toml $work/examples/
     cp ${hyprland}/*.lua $work/contrib/hyprland/
     (cd $work/src && HOME=$work python3 -B -m unittest -q test_zonecfg)
-    python3 -B -m py_compile $lib/zone.py $lib/zone_init.py
+    python3 -B -m py_compile $lib/zone.py $lib/zone_init.py $lib/appzones/*.py
     python3 -B -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' $lib/appzones-mount-helper
 
     # /run/current-system/sw/bin last: systemctl, journalctl, nix and hyprctl

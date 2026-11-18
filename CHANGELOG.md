@@ -5,6 +5,9 @@ The config schema has its own release number (`requires = N` in
 
 ## Unreleased
 
+- `src/zone.py` is split into modules under `src/appzones/` (client, server, fs, net,
+  portals, agent, mounts, upgrade, common); no change in behaviour.
+
 ## 0.6.1
 
 - zone-init's control socket is created by the host, outside the zone

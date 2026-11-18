@@ -4,7 +4,7 @@
 default:
     @just --list
 
-# Unit tests of the validator and parts of zone.py (fast, no Nix)
+# Unit tests of the validator and parts of the appzones modules (fast, no Nix)
 test:
     cd src && python3 -B -m unittest -q test_zonecfg
 

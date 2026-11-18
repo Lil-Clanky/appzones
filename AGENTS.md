@@ -1,6 +1,9 @@
 # Agent notes for appzones
 
-- Code: `src/` (`zone.py` CLI and supervisor, `zone_init.py` the agent
+- Code: `src/` (`zone.py` the entry point and `appzones/` its modules: `client`
+  the commands, `server` the supervisor, `fs` the bwrap command line, `net`,
+  `portals`, `mounts`, `agent`, `upgrade`, `common` settings read as `common.X`;
+  `zone_init.py` the agent
   inside a zone, `zonecfg.py` schema and validator, `zone_mount_helper.py`
   the root step of `appzones mount`, `zone-wayland/` the security-context
   helper). Nix: `nix/package.nix`, `nix/module.nix`, `tests/vm.nix`.

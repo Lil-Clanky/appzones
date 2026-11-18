@@ -33,12 +33,17 @@ reviews:
         or value needs RELEASE bumped, an entry in SINCE, a unit test in
         src/test_zonecfg.py, and docs in docs/configuration/reference.md and examples/zones.toml.
         Malformed values must be errors, never a crash.
-    - path: "src/zone.py"
+    - path: "src/appzones/**"
       instructions: |
-        The CLI and the supervisor that builds the bubblewrap command line.
-        Flag anything that gives a zone more: new binds, sockets, environment
-        variables, D-Bus names, devices or capabilities. Binds are pinned by
-        fd (--bind-fd) and checked after opening; keep it that way.
+        The CLI commands (client.py), the supervisor (server.py), the bubblewrap
+        command line (fs.py), the network (net.py), D-Bus and links (portals.py),
+        runtime mounts (mounts.py). Flag anything that gives a zone more: new
+        binds, sockets, environment variables, D-Bus names, devices or
+        capabilities. Binds are pinned by fd (--bind-fd) and checked after
+        opening; zone-init's socket is made by the host (server.py); keep both.
+        Cross-module settings are read as `common.X` at call time, never copied.
+    - path: "src/zone.py"
+      instructions: "The entry point: usage text, argument parsing and dispatch only; logic belongs in src/appzones/."
     - path: "src/zone_init.py"
       instructions: |
         Runs inside the zone (PID 2 under bwrap) and serves the control socket.
