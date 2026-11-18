@@ -11,7 +11,7 @@ The only place it mounts or unmounts is
     <the sudo caller's home>/.local/share/appzones/ZONE/mnt/NAME
 (or .local/share/zones, the pre-0.6 place, while .local/share/appzones does
 not exist: appzones has not moved it yet), which a running zone sees as
-/mnt/host/NAME (zone.py binds .../ZONE/mnt read-only at /mnt/host; a host
+/mnt/host/NAME (appzones/fs.py binds .../ZONE/mnt read-only at /mnt/host; a host
 mount below it propagates into the zone).
 
 Why a caller cannot abuse it (docs/configuration/files.md, "Runtime mounts"):
@@ -119,7 +119,7 @@ class Caller:
     def mnt_dir(self, zone: str) -> str:
         if not zonecfg.NAME_RE.match(zone or "") or zone in zonecfg.RESERVED:
             die(f"zone {zone!r}: not a zone name")
-        # the caller's state directory, chosen as appzones (zone.py) chooses
+        # the caller's state directory, chosen as appzones (appzones/common.py) chooses
         # it; either way open_owned refuses a symlink anywhere on the path and
         # anything but a directory of the caller's at exactly that path
         base = f"{self.home}/.local/share/appzones"

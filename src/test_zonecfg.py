@@ -15,6 +15,34 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# the modules behind `appzones` (src/zone.py was split into these, #35), common first:
+# the others read its settings at call time
+ZONE_MODULES = ["common", "net", "fs", "portals", "agent", "server", "client", "mounts", "upgrade"]
+
+
+class _Zone:
+    """The appzones modules as one namespace: reading a name finds the module that
+    defines it; setting one sets it there and wherever it was imported by name
+    (so a test can replace a function or a setting where the code looks it up)."""
+
+    def __init__(self, mods):
+        object.__setattr__(self, "_mods", mods)
+
+    def _owner(self, name):
+        for m in self._mods:
+            if name in vars(m):
+                return m
+        raise AttributeError(name)
+
+    def __getattr__(self, name):
+        return getattr(self._owner(name), name)
+
+    def __setattr__(self, name, value):
+        # also where another module imported it by name (`from .common import load_cfg`)
+        old = getattr(self._owner(name), name)
+        for m in self._mods:
+            if name in vars(m) and vars(m)[name] is old:
+                setattr(m, name, value)
 
 
 class ZonecfgTest(unittest.TestCase):
@@ -84,9 +112,7 @@ class ZonecfgTest(unittest.TestCase):
         self.assertEqual(set(cfg.zones), {"daily", "untrusted"})
 
     def test_zone_new_creates_a_missing_config(self):
-        sys.path.insert(0, str(HERE))
-        import zone
-        zone = importlib.reload(zone)
+        zone = self._zone_mod()
         zone.CONFIG = Path(self.tmp.name) / "fresh/zones.toml"
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(zone.new("games", False), 0)  # a preview writes nothing
@@ -257,9 +283,14 @@ class ZonecfgTest(unittest.TestCase):
             self._zone_mod()
 
     def _zone_mod(self):
+        """The appzones modules, freshly loaded (they read the environment at import), as one namespace."""
         sys.path.insert(0, str(HERE))
-        import zone
-        return importlib.reload(zone)
+        import appzones
+        mods = []
+        for name in ZONE_MODULES:
+            m = importlib.import_module(f"appzones.{name}")
+            mods.append(importlib.reload(m))
+        return _Zone(mods)
 
     def test_nft_rules(self):
         """Every host address refused (never the host itself), NetBird networks allowed only with netbird,
@@ -785,8 +816,7 @@ class ZonecfgTest(unittest.TestCase):
         usbdev("5-2", "1050", "0407", "5", "3", hid="hidraw2")  # a YubiKey: never
         (root / "sys/bus/usb/devices/usb5").symlink_to(devs)  # the root hub: no idVendor here
         sys.path.insert(0, str(HERE))
-        import zone
-        zone = importlib.reload(zone)
+        zone = self._zone_mod()
         a, found = zone.usb_binds(["abcd"], root=str(root))
         real = "/" + os.path.relpath(os.path.realpath(devs / "5-1"), os.path.realpath(root))
         self.assertEqual(len(found), 1, found)

@@ -50,8 +50,8 @@ ZONE = os.environ.get("ZONE", "?")
 # Mozilla apps own org.mozilla.<remoting name>.<profile> on the host bus for
 # their "already running" remote. Every zone's profile is named the same, so
 # each zone's app gets its own D-Bus app name (MOZ_DBUS_APP_NAME), and the proxy lets the zone own
-# only that one (zone.py dbus_rules): a second launch reaches this zone's
-# Firefox and never another zone's or the host's. Keep in step with zone.py.
+# only that one (appzones/portals.py dbus_rules): a second launch reaches this zone's
+# Firefox and never another zone's or the host's. Keep in step with appzones/portals.py.
 MOZ_APPS = ("firefox", "firefox-esr", "firefox-beta", "firefox-devedition", "firefox-nightly", "librewolf")
 
 
