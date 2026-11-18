@@ -1362,7 +1362,7 @@ def zone_list(as_json: bool = False) -> int:
             try:
                 apps_count = len(zone_procs(n))
                 apps_table, apps_json = str(apps_count), apps_count
-            except OSError:
+            except (OSError, ValueError):  # gone, or stopped mid-reply: unknown
                 apps_table, apps_json = "?", None
             state = "running" + (" (stale)" if stale(n, z) else "")
         else:
