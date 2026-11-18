@@ -6,6 +6,7 @@ depends on, or touches, the real home.
 import contextlib
 import importlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -861,6 +862,49 @@ class ZonecfgTest(unittest.TestCase):
         self.assertRefused(e, "unknown zone 'nope'")
         self.assertRefused(e, "args for 'other'")
         self.assertRefused(e, "undeclared app 'ghost'")
+
+    def test_list_json(self):
+        """zone_list --json outputs valid JSON with correct fields for running and stopped zones."""
+        zone = self._zone_mod()
+        # Stub the functions that would call real system resources
+        zone.ping = lambda n: {"ok": True} if n == "daily" else None
+        zone.zone_procs = lambda n: [1, 2]
+        zone.stale = lambda n, z: False
+        zone.load_cfg = lambda quiet=False: self.cfg('version = 1\nrequires = ' + str(self.z.RELEASE) + '\n'
+                                                      '[zones.daily]\ncolour = "#a6e3a1"\nnetwork = "internet"\n'
+                                                      '[zones.work]\ncolour = "#f38ba8"\nnetwork = "none"\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            zone.zone_list(as_json=True)
+        data = json.loads(out.getvalue())
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 2)
+        # Find zones by name
+        daily = next((z for z in data if z["name"] == "daily"), None)
+        work = next((z for z in data if z["name"] == "work"), None)
+        self.assertIsNotNone(daily)
+        self.assertIsNotNone(work)
+        # Check daily zone (running)
+        self.assertEqual(daily["name"], "daily")
+        self.assertEqual(daily["state"], "running")
+        self.assertEqual(daily["network"], "internet")
+        self.assertEqual(daily["dns"], "host")
+        self.assertEqual(daily["devices"], ["gpu", "audio"])
+        self.assertEqual(daily["apps"], 2)
+        self.assertEqual(daily["colour"], "#a6e3a1")
+        # Check work zone (stopped)
+        self.assertEqual(work["name"], "work")
+        self.assertEqual(work["state"], "stopped")
+        self.assertEqual(work["network"], "none")
+        self.assertIsNone(work["apps"])
+        # Verify table output also works
+        out2 = io.StringIO()
+        with contextlib.redirect_stdout(out2):
+            zone.zone_list(as_json=False)
+        table = out2.getvalue()
+        self.assertIn("ZONE", table.split("\n")[0])
+        self.assertIn("running", table)
+        self.assertIn(" 2 ", table)
 
 
 if __name__ == "__main__":
