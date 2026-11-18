@@ -36,7 +36,7 @@ def up(name: str, quiet: bool = False) -> None:
     else:
         common.RT.mkdir(parents=True, exist_ok=True)
         log = open(common.RT / f"{name}.log", "ab")
-        subprocess.Popen([sys.executable, str(common.HERE / "zone.py"), "_supervise", name], stdout=log, stderr=log,
+        subprocess.Popen([sys.executable, str(common.HERE / "zone.py"), "serve", name], stdout=log, stderr=log,
                          stdin=subprocess.DEVNULL, start_new_session=True)
     for _ in range(200):
         if agent.ping(name):
@@ -237,17 +237,92 @@ def shell(name: str) -> int:
     return 0
 
 
+def each_zone(cmd: str, rest: list[str], fn) -> int:
+    """`appzones up|stop|restart ZONE|--all`: FN for one zone or every configured one.
+    `stop --all` skips zones that do not answer (nothing to stop); `stop ZONE` always tries."""
+    if not rest:
+        die(f"usage: appzones {cmd} ZONE|--all")
+    every = rest[0] == "--all"
+    failed = 0
+    for n in list(load_cfg(quiet=True).zones) if every else [rest[0]]:
+        if cmd == "stop" and every and not agent.ping(n):
+            continue
+        load_zone(n)
+        try:
+            fn(n)
+        except SystemExit as e:  # said why already; go on with the other zones
+            if e.code:
+                failed += 1
+    return 1 if failed else 0
+
+
+def _is_server(pid: int, name: str) -> bool:
+    """PID is zone NAME's server, as this user (common.server_command)."""
+    d = Path(f"/proc/{pid}")
+    try:
+        if d.stat().st_uid != common.UID:
+            return False
+        argv = [a.decode(errors="replace") for a in (d / "cmdline").read_bytes().split(b"\0")]
+        cwd = os.readlink(d / "cwd")
+    except OSError:
+        return False
+    found = common.server_command(argv, cwd)
+    return found is not None and found[1] == name
+
+
+def server_pids(name: str) -> list[int]:
+    """The processes that are zone NAME's server (normally none or one)."""
+    out = []
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit() and int(d.name) != os.getpid() and _is_server(int(d.name), name):
+            out.append(int(d.name))
+    return out
+
+
 def stop_zone(name: str) -> None:
     if use_systemd():
         systemctl("stop", f"appzones@{name}.service")
-        return
-    out = subprocess.run(["pgrep", "-f", f"zone.py _supervise {name}$"], capture_output=True, text=True).stdout.split()
-    for p in out:
-        os.kill(int(p), signal.SIGTERM)
+    else:
+        pfds = []
+        for pid in server_pids(name):
+            try:
+                pfd = os.pidfd_open(pid)
+            except OSError:
+                continue  # gone already
+            try:
+                if _is_server(pid, name):  # still the same process: the pidfd pins it
+                    signal.pidfd_send_signal(pfd, signal.SIGTERM)
+                    pfds.append(pfd)
+                    continue
+            except ProcessLookupError:
+                pass  # exited just now
+            except OSError as e:
+                warn(f"zone {name}: could not signal its server (pid {pid}): {e.strerror or e}")
+            os.close(pfd)
+        # until the servers have exited: their cleanup must not overlap a new start (restart)
+        try:
+            end = time.monotonic() + 20
+            poll = select.poll()
+            for p in pfds:
+                poll.register(p, select.POLLIN)  # a pidfd is readable once the process exits
+            while pfds:
+                ready = poll.poll(max(0, int((end - time.monotonic()) * 1000)))
+                if not ready:
+                    die(f"zone {name}: its server did not exit within 20 s after SIGTERM")
+                for p, _ in ready:
+                    poll.unregister(p)
+                    pfds.remove(p)
+                    os.close(p)
+        finally:
+            for p in pfds:
+                os.close(p)
     for _ in range(100):
         if not agent.ping(name):
             return
         time.sleep(0.1)
+    die(f"zone {name} still answers: it runs outside {'its unit' if use_systemd() else 'appzones'} "
+        f"(an `appzones serve {name}` in a terminal or another process manager); stop it there "
+        "(SIGTERM or Ctrl-C)")
 
 
 def restart_zone(name: str) -> None:

@@ -1,12 +1,14 @@
-"""The zone supervisor (`appzones _supervise`), `_netsetup`, the agent socket, colours."""
+"""The zone server (`appzones serve`), `_netsetup`, the agent socket, colours."""
 from __future__ import annotations
 
+import fcntl
 import os
 import secrets
 import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,7 +49,40 @@ def sd_notify(msg: str) -> None:
             pass
 
 
-def supervise(name: str) -> int:
+def notify_fd_ok(fd: int) -> bool:
+    """FD is open for writing, and a pipe, FIFO, file or character device (s6 uses a pipe)."""
+    try:
+        mode = os.fstat(fd).st_mode
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except (OSError, OverflowError):
+        return False
+    if flags & os.O_ACCMODE not in (os.O_WRONLY, os.O_RDWR):
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode) or stat.S_ISCHR(mode)
+
+
+def notify_ready(name: str, notify_fd: int | None) -> None:
+    """The zone answers: tell systemd (sd_notify) and, with --notify-fd, a newline on that fd (s6)."""
+    sd_notify("READY=1\nSTATUS=zone " + name + " running")
+    if notify_fd is not None:
+        try:
+            os.write(notify_fd, b"\n")
+        except OSError as e:
+            print(f"[zone] {name}: could not write readiness to fd {notify_fd}: {e.strerror or e}", flush=True)
+        finally:
+            try:
+                os.close(notify_fd)
+            except OSError:
+                pass
+
+
+def supervise(name: str, notify_fd: int | None = None) -> int:
+    """The zone NAME, in the foreground (`appzones serve`): builds it, holds it, and
+    returns when it ends. SIGTERM or SIGINT stops it and its helpers."""
+    if notify_fd is not None:
+        if notify_fd < 3 or not notify_fd_ok(notify_fd):
+            die(f"--notify-fd {notify_fd}: not a pipe or file above 2, open for writing")
+        os.set_inheritable(notify_fd, False)  # never into the zone or a helper
     cfg = load_cfg(quiet=False)
     if name not in cfg.zones:
         die(f"no zone {name!r} in {common.CONFIG}")
@@ -134,7 +169,7 @@ def supervise(name: str) -> int:
         shutil.rmtree(fp, ignore_errors=True)
         return 1
     if child.poll() is None:
-        sd_notify("READY=1\nSTATUS=zone " + name + " running")
+        notify_ready(name, notify_fd)
         print(f"[zone] {name} ready (network={network}, dns={s['dns']}, devices={','.join(s['devices']) or '-'})",
               flush=True)
         for app in s["autostart_apps"]:

@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -241,6 +242,117 @@ class ZonecfgTest(unittest.TestCase):
         self.assertEqual(sorted(pages - listed), [], "docs pages missing from docs/_data/llms.yml")
         self.assertEqual(sorted(listed - pages), [], "docs/_data/llms.yml names pages that do not exist")
 
+    def test_each_zone(self):
+        """up/stop/restart ZONE|--all; `stop --all` skips zones that do not answer, `stop ZONE` always tries."""
+        zone = self._zone_mod()
+        cfg = self.cfg('version = 1\n[zones.aa]\ncolour = "#111111"\n[zones.bb]\ncolour = "#222222"\n')
+        zone.load_cfg = lambda quiet=False: cfg
+        zone.load_zone = lambda name, quiet=True: cfg.zones[name]
+        zone.ping = lambda n: {"ok": True} if n == "aa" else None
+        for cmd, rest, want in [("stop", ["--all"], ["aa"]), ("stop", ["bb"], ["bb"]), ("up", ["--all"], ["aa", "bb"])]:
+            done = []
+            self.assertEqual(zone.each_zone(cmd, rest, done.append), 0)
+            self.assertEqual(done, want, (cmd, rest))
+        # one zone that fails does not keep the others from being handled; the result says so
+        done = []
+
+        def fail_aa(n):
+            done.append(n)
+            if n == "aa":
+                raise SystemExit(1)
+        self.assertEqual(zone.each_zone("up", ["--all"], fail_aa), 1)
+        self.assertEqual(done, ["aa", "bb"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            zone.each_zone("up", [], print)
+
+    def test_server_pids(self):
+        """stop without systemd finds exactly this appzones' `zone.py serve NAME`, also from a
+        relative path; never another program called zone.py, nor another zone's server."""
+        import subprocess as sp
+        zone = self._zone_mod()
+        t = Path(self.tmp.name)
+        mine, other = t / "lib", t / "elsewhere"
+        for d in (mine, other):
+            d.mkdir()
+            (d / "zone.py").write_text("import time\ntime.sleep(30)\n")
+        zone.HERE = mine
+        procs = []
+        try:
+            for argv, cwd in [([sys.executable, "-B", str(mine / "zone.py"), "serve", "aa", "--notify-fd", "9"], None),
+                              ([sys.executable, "zone.py", "_supervise", "bb"], mine),        # relative path
+                              ([sys.executable, str(other / "zone.py"), "serve", "aa"], None),   # not ours
+                              ([sys.executable, str(mine / "zone.py"), "serve", "aaa"], None)]:  # another zone
+                procs.append(sp.Popen(argv, cwd=cwd))
+            time.sleep(0.3)
+            self.assertEqual(zone.server_pids("aa"), [procs[0].pid])
+            self.assertEqual(zone.server_pids("bb"), [procs[1].pid])
+            self.assertEqual(zone.server_pids("cc"), [])
+        finally:
+            for p in procs:
+                p.kill()
+                p.wait()
+
+    def test_server_command(self):
+        """Only the process's own script counts; an installed appzones from the store counts too."""
+        zone = self._zone_mod()
+        here = str(zone.HERE / "zone.py")
+        cases = [
+            (["python3", "-B", here, "serve", "aa"], ("serve", "aa")),
+            (["python3", here, "_supervise", "bb", "--x"], ("_supervise", "bb")),
+            (["python3", "-c", "x", here, "serve", "aa"], None),                  # a script after -c CODE is not ours
+            (["python3", "/home/u/tools/zone.py", "serve", "aa"], None),          # another zone.py
+            (["python3", here, "run", "--wait", "td", "--", "python3", here, "serve", "td"], None),  # a later argument
+            (["python3", "/nix/store/abc-appzones-0.6.0/libexec/appzones/zone.py", "_supervise", "cc"], ("_supervise", "cc")),
+            (["python3", "/nix/store/abc-x/libexec/other/zone.py", "serve", "cc"], None),
+            (["python3", here, "serve"], None),
+            (["python3", "-X", "dev", here, "serve", "aa"], ("serve", "aa")),         # an option with a value
+            (["python3", "-m", "x", here, "serve", "aa"], None),
+        ]
+        for argv, want in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(zone.server_command(argv, "/"), want)
+
+    def test_serve_readiness_fd(self):
+        """--notify-fd N: a newline on N once the zone answers, then N closed; a bad fd is refused."""
+        zone = self._zone_mod()
+        zone.sd_notify = lambda msg: None  # never the real service manager of whoever runs the tests
+        r, w = os.pipe()
+        try:
+            os.set_blocking(r, False)
+            self.assertTrue(zone.notify_fd_ok(w))
+            self.assertFalse(zone.notify_fd_ok(r))  # the read end: refused
+            self.assertFalse(zone.notify_fd_ok(2**31))  # no such fd (overflow)
+            zone.notify_ready("aa", w)
+            self.assertEqual(os.read(r, 10), b"\n")
+            self.assertEqual(os.read(r, 10), b"")  # end of file: the write end was closed
+            self.assertFalse(zone.notify_fd_ok(w))
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                zone.supervise("aa", notify_fd=w)  # not open: refused before anything starts
+        finally:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_serve_arguments(self):
+        """`appzones serve ZONE [--notify-fd N]`; `_supervise ZONE` still works (units still running)."""
+        sys.path.insert(0, str(HERE))
+        import zone as entry
+        entry = importlib.reload(entry)
+        calls = []
+        entry.server.supervise = lambda name, notify_fd=None: calls.append((name, notify_fd)) or 0
+        entry.main(["serve", "aa"])
+        entry.main(["serve", "aa", "--notify-fd", "5"])
+        entry.main(["serve", "aa", "--notify-fd=6"])
+        entry.main(["_supervise", "bb"])
+        self.assertEqual(calls, [("aa", None), ("aa", 5), ("aa", 6), ("bb", None)])
+        for bad in (["serve"], ["serve", "aa", "--notify-fd"], ["serve", "aa", "--notify-fd", "x"],
+                    ["serve", "aa", "--notify-fd=\u00b2"], ["serve", "aa", "--notify-fd", "9" * 20], ["serve", "aa", "--other"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                entry.main(bad)
+        importlib.reload(importlib.import_module("appzones.server"))
+
     def test_hyprland_zones_lua_is_a_copy(self):
         """contrib/hyprland/zones.lua (pre-0.6 name) is appzones.lua's code, past each file's header comment."""
         def code(name):
@@ -285,7 +397,6 @@ class ZonecfgTest(unittest.TestCase):
     def _zone_mod(self):
         """The appzones modules, freshly loaded (they read the environment at import), as one namespace."""
         sys.path.insert(0, str(HERE))
-        import appzones
         mods = []
         for name in ZONE_MODULES:
             m = importlib.import_module(f"appzones.{name}")

@@ -98,6 +98,9 @@ let
     patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $out/bin/generic-hello
   '';
 
+  # looks like another appzones installation's zone server (upgrade test)
+  oldServer = pkgs.writeTextDir "libexec/appzones/zone.py" "import time; time.sleep(600)\n";
+
   fhsHello = pkgs.buildFHSEnv {
     name = "fhs-hello";
     runScript = pkgs.writeShellScript "fhs-hello" "echo fhs-ok";
@@ -431,9 +434,9 @@ pkgs.testers.runNixOSTest {
     with subtest("upgrade from 0.5: the state moves once no zone runs; the old config is read, with a warning"):
         machine.succeed("test -f /etc/appzones/denied-paths && test ! -e /etc/zones")
         # a supervisor (of any version) running: nothing moves yet
-        # (a stand-in: its command line looks like a supervisor's)
-        u("systemd-run --user --collect --unit=old-supervisor ${pkgs.python3}/bin/python3 -c "
-          "'import time; time.sleep(600)' zone.py _supervise old")
+        # (a stand-in for an older appzones' server: an installed .../libexec/appzones/zone.py)
+        u("systemd-run --user --collect --unit=old-supervisor ${pkgs.python3}/bin/python3 "
+          "${oldServer}/libexec/appzones/zone.py _supervise old")
         machine.wait_until_succeeds("pgrep -u alice -f '_supervise old'", timeout=10)
         out = u("appzones list 2>&1")
         print(out)
@@ -944,5 +947,28 @@ pkgs.testers.runNixOSTest {
         assert [(c["pid"], c["title"]) for c in ff_windows("ta")] == ta_before, ff_windows("ta")
         print("PASS  a second launch in tc opens in tc's Firefox, never ta's")
         u("appzones stop --all")
+
+    with subtest("appzones serve: a foreground zone server, outside its unit, s6-style readiness"):
+        appz = machine.succeed("readlink -f $(command -v appzones)").strip()
+        # KillMode=process: stopping the unit signals only `serve` itself, so anything
+        # it fails to clean up stays behind and is caught below
+        u("systemd-run --user --collect --unit=serve-td -p KillMode=process /bin/sh -c "
+          + shlex.quote(f"exec {appz} serve td --notify-fd 3 3>/tmp/td-ready"))
+        machine.wait_until_succeeds("test -s /tmp/td-ready", timeout=90)
+        assert machine.succeed("cat /tmp/td-ready") == "\n"
+        print("PASS  readiness: a newline on --notify-fd once the zone answers")
+        u("appzones ping td")
+        u("! systemctl --user is-active appzones@td.service")
+        ok("td", "true", "the zone runs apps without its systemd unit")
+        rc, out = u("appzones stop td 2>&1", check=False)
+        print(out)
+        assert rc != 0 and "still answers" in out and "appzones serve td" in out, (rc, out)
+        print("PASS  stop through the unit fails clearly for a zone served outside it")
+        # without systemd, stop finds exactly this zone's `serve` and signals it
+        u("APPZONES_SUPERVISOR=none appzones stop td")
+        machine.wait_until_fails("su -l alice -c " + shlex.quote(ENV + "systemctl --user is-active serve-td"), timeout=60)
+        machine.wait_until_fails("pgrep -u alice -f 'dev.mirql.zone.td|appzones/td/|zone-td-'", timeout=30)
+        u("! appzones ping td")
+        print("PASS  stop without systemd ends serve; the zone and every helper are gone (nothing left behind)")
   '';
 }
