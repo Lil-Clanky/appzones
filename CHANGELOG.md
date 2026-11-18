@@ -5,6 +5,10 @@ The config schema has its own release number (`requires = N` in
 
 ## Unreleased
 
+- **JSON output for `appzones list --json`**: prints a JSON array with one object per zone,
+  for scripts, status bars and AI agents. Fields: `name`, `state`, `network`, `dns`, `devices`,
+  `apps`, `colour`.
+
 - **A docs site**: https://mirql.github.io/appzones/ (the guide, with search), built by
   GitHub Pages from `docs/`.
 

@@ -53,6 +53,7 @@ to "just make it work"; explain the trade-off and let the user decide.
 
 ```bash
 command -v appzones && appzones list     # zones: state, network, dns, devices, apps running, colour
+appzones list --json                     # the same as JSON, for scripts and bars
 appzones which ZONE                      # every setting in effect and where it came from
 ```
 

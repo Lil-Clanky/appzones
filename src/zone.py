@@ -1,6 +1,7 @@
 """appzones: app zones on this host (appzones, https://github.com/mirql/appzones).
 
-    appzones list                          zones: state, network, dns, devices, apps running, colour
+    appzones list [--json]                 zones: state, network, dns, devices, apps running, colour
+                                           (--json: one object per zone, for scripts and bars)
     appzones which ZONE                    every setting in effect and where it came from
     appzones run [--restart] [--bus B] ZONE APP [ARGS...]
     appzones run [--restart] [--bus B] [--wait] ZONE -- CMD [ARGS...]
@@ -1315,22 +1316,30 @@ def restart_zone(name: str) -> None:
     up(name, quiet=True)
 
 
-def zone_list() -> int:
+def zone_list(as_json: bool = False) -> int:
     cfg = load_cfg(quiet=True)
     rows = [("ZONE", "STATE", "NETWORK", "DNS", "DEVICES", "APPS", "COLOUR")]
+    zones = []
     for n, z in cfg.zones.items():
         s = z.settings
         net = s["network"] + ("+netbird" if s["netbird"] else "")
         if ping(n):
             try:
-                apps = str(len(zone_procs(n)))
+                apps_count = len(zone_procs(n))
+                apps_table, apps_json = str(apps_count), apps_count
             except OSError:
-                apps = "?"
+                apps_table, apps_json = "?", None
             state = "running" + (" (stale)" if stale(n, z) else "")
         else:
-            state, apps = "stopped", "-"
+            apps_table, apps_json = "-", None
+            state = "stopped"
         devs = [f"usb({'+'.join(s['usb'])})" if d == "usb" else d for d in s["devices"]]
-        rows.append((n, state, net, s["dns"], ",".join(devs) or "-", apps, s["colour"]))
+        rows.append((n, state, net, s["dns"], ",".join(devs) or "-", apps_table, s["colour"]))
+        zones.append({"name": n, "state": state, "network": net, "dns": s["dns"],
+                      "devices": devs, "apps": apps_json, "colour": s["colour"]})
+    if as_json:
+        print(json.dumps(zones))
+        return 0
     w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
@@ -1764,7 +1773,7 @@ def main(argv: list[str]) -> int:
     if cmd == "_autostart":
         return autostart()
     if cmd == "list":
-        return zone_list()
+        return zone_list("--json" in rest)
     if cmd == "which":
         return which(one())
     if cmd == "up":
