@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -198,6 +199,21 @@ class ZonecfgTest(unittest.TestCase):
         self.assertEqual(c.mnt_dir("ta"), f"{new}/ta/mnt")
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             c.mnt_dir("../x")
+
+    @unittest.skipUnless((HERE.parent / "docs/index.md").exists(), "no docs in this tree (package build)")
+    def test_llms_txt_lists_every_docs_page(self):
+        """docs/_data/llms.yml (llms.txt, llms-full.txt) names every guide page, and only pages that exist."""
+        docs = HERE.parent / "docs"
+        catalog = docs / "_data/llms.yml"
+        self.assertTrue(catalog.exists(), "docs/_data/llms.yml is missing")
+        pages = {str(p.relative_to(docs)) for p in docs.rglob("*.md")} - {"index.md", "guide.md"}
+        listed = set()
+        for line in catalog.read_text().splitlines():
+            m = re.match(r"^    - file:\s*([^#]+?)\s*(#.*)?$", line)  # a page entry, at its own indentation
+            if m:
+                listed.add(m.group(1).strip("\"'"))
+        self.assertEqual(sorted(pages - listed), [], "docs pages missing from docs/_data/llms.yml")
+        self.assertEqual(sorted(listed - pages), [], "docs/_data/llms.yml names pages that do not exist")
 
     def test_hyprland_zones_lua_is_a_copy(self):
         """contrib/hyprland/zones.lua (pre-0.6 name) is appzones.lua's code, past each file's header comment."""
