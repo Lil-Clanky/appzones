@@ -55,6 +55,7 @@ Docs: https://mirql.github.io/appzones/ (docs/ in the repo).
 """
 from __future__ import annotations
 
+import difflib
 import json
 import sys
 from pathlib import Path
@@ -70,6 +71,13 @@ from appzones import agent, client, mounts, server, upgrade  # noqa: E402
 VERSION = "@version@"
 
 
+# The commands a user types. The internal ones (`_netsetup`, `_autostart`) and
+# the retired `_supervise` name are left out on purpose: they are for systemd
+# and the supervisor, and suggesting one for a typo would be wrong.
+COMMANDS = ("active", "apps", "check", "list", "logs", "mount", "mounts", "new", "ping", "ps",
+            "restart", "run", "serve", "shell", "stop", "umount", "up", "which")
+
+
 def version_line() -> str:
     version = "unknown" if VERSION.startswith("@") else VERSION
     return f"appzones {version} (config release {zonecfg.RELEASE})"
@@ -83,7 +91,8 @@ def main(argv: list[str]) -> int:
         print(version_line())
         return 0
     cmd, rest = argv[0], argv[1:]
-    if cmd == "_autostart" or not (cmd.startswith("_") or cmd in ("active", "serve")):
+    # only for a command we know: a typo touches nothing
+    if cmd == "_autostart" or (cmd in COMMANDS and cmd not in ("active", "serve")):
         upgrade.migrate_state()
 
     def one() -> str:
@@ -183,8 +192,9 @@ def main(argv: list[str]) -> int:
         if cmd == "mounts" and len(words) == 1:
             return mounts.mounts(words[0])
         die("usage: appzones mount ZONE HOST-DIR [--ro] [--as NAME] | appzones umount ZONE NAME [--lazy] | appzones mounts ZONE")
-    print(__doc__, file=sys.stderr)
-    return 2
+    near = difflib.get_close_matches(cmd, COMMANDS, n=1, cutoff=0.75)
+    die(f"unknown command {cmd!r}" + (f" (did you mean {near[0]!r}?)" if near else "")
+        + "; see appzones --help", 2)
 
 
 if __name__ == "__main__":

@@ -629,6 +629,30 @@ os.write(w, b"\\n"); os.close(w)
                 except OSError:
                     pass
 
+    def test_unknown_command_suggests_the_nearest(self):
+        """An unknown command says so in one line, with the nearest command, and exits 2 (#74)."""
+        sys.path.insert(0, str(HERE))
+        import zone as entry
+        entry = importlib.reload(entry)
+        migrated = []
+        real_migrate = entry.upgrade.migrate_state
+        entry.upgrade.migrate_state = lambda *a, **k: migrated.append(a)
+        self.addCleanup(setattr, entry.upgrade, "migrate_state", real_migrate)
+        # die() prints the line and exits 2, so the message is what to assert
+        for args, want in (
+            (["lsit"], "appzones: unknown command 'lsit' (did you mean 'list'?); see appzones --help" + chr(10)),
+            (["zzzzzz"], "appzones: unknown command 'zzzzzz'; see appzones --help" + chr(10)),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as ex:
+                entry.main(args)
+            self.assertEqual(ex.exception.code, 2, args)
+            self.assertEqual(err.getvalue(), want)
+        # the internal commands are not suggested, even for a near miss
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            entry.main(["netsetup"])
+        self.assertNotIn("_netsetup", err.getvalue())
+        self.assertEqual(migrated, [])  # a typo migrates no state
+
     def test_version_flag(self):
         """`appzones --version` and `-V`: the package version (a placeholder in a source checkout) and the config release."""
         sys.path.insert(0, str(HERE))
