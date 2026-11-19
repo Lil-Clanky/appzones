@@ -31,9 +31,16 @@ nix_ld   = true                         # prebuilt binaries from npm and pip run
 tmp      = "disk"                       # /tmp survives restarts
 ```
 
+On Ubuntu or Debian, leave out `packages` and `nix_ld` (NixOS's): the zone
+uses the host's programs from `/usr`, so install them on the host first
+(`sudo apt install nodejs npm python3-venv`), and prebuilt binaries run
+there anyway. Debian's and Ubuntu's `pip` installs only into a virtual
+environment: `python3 -m venv .venv && . .venv/bin/activate` inside the zone.
+
 ```bash
 appzones run dev -- kitty -e tmux new -As dev   # a terminal + tmux session inside
-# then, inside: npm install, npm run dev, pip install ...
+appzones shell dev                              # or, without a desktop (SSH): a shell inside
+# then, inside: cd ~/src/my-app, then npm install, npm run dev, pip install ...
 ```
 
 The tmux server, `~/.npm`, `~/.cache` and every install script stay inside
@@ -48,11 +55,12 @@ Give an agent one project and nothing else:
 colour   = "#cba6f7"
 binds    = [{ path = "~/src/my-app", mode = "rw" }]
 packages = ["nodejs", "git"]
-nix_ld   = true
+nix_ld   = true                         # NixOS; on Ubuntu or Debian leave out these two lines
 ```
 
 ```bash
 appzones run agents -- kitty     # install and log in to your agent CLI in there
+appzones shell agents            # the same without a desktop (SSH)
 ```
 
 The agent's login, its tokens and its history stay in the zone's home. It
