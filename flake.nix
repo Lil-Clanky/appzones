@@ -15,6 +15,15 @@
       packages = forAll (pkgs: rec {
         appzones = pkgs.callPackage ./nix/package.nix { };
         default = appzones;
+        # the Rust helpers (optional, design/rust.md): static, with musl
+        helper = pkgs.pkgsStatic.callPackage ./nix/helper.nix { };
+        # appzones with them
+        # the root step of `appzones mount` in Rust: linked against glibc, not static
+        mount-helper = pkgs.callPackage ./nix/helper.nix { bin = "appzones-mount-helper"; };
+        appzones-rust = appzones.override {
+          inherit helper;
+          rustMountHelper = mount-helper;
+        };
       });
 
       overlays.default = final: _prev: {
@@ -33,6 +42,38 @@
           package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
           # `make install` (outside Nix) into a staging directory
           make-install = import ./tests/make-install.nix { inherit pkgs; };
+          # the Rust helper builds, statically, and its tests pass (cargo test in the build)
+          helper = self.packages.${pkgs.stdenv.hostPlatform.system}.helper;
+          mount-helper = self.packages.${pkgs.stdenv.hostPlatform.system}.mount-helper;
+          # the Rust zone-init meets the agent protocol's specification (AgentProtocolTest)
+          agent-protocol-rust =
+            pkgs.runCommand "appzones-agent-protocol-rust"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                src = ./.;
+              }
+              ''
+                cp -r --no-preserve=mode $src/src $src/examples $src/contrib . && cd src
+                APPZONES_TEST_ZONE_INIT="${
+                  self.packages.${pkgs.stdenv.hostPlatform.system}.helper
+                }/bin/appzones-helper zone-init" \
+                  HOME=$TMPDIR python3 -B -m unittest -v test_zonecfg.AgentProtocolTest
+                touch $out
+              '';
+          # the never-list in Rust (the root step's) answers as zonecfg's, path by path
+          policy-rust =
+            pkgs.runCommand "appzones-policy-rust"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                src = ./.;
+              }
+              ''
+                cp -r --no-preserve=mode $src/src $src/examples $src/contrib . && cd src
+                APPZONES_TEST_HELPER="${
+                  self.packages.${pkgs.stdenv.hostPlatform.system}.helper
+                }/bin/appzones-helper" HOME=$TMPDIR python3 -B -m unittest -v test_zonecfg.DifferentialPolicyTest
+                touch $out
+              '';
           # appzones on other distributions, in their disk images (offline, ~3 min each)
           debian12 = import ./tests/distro.nix {
             inherit pkgs;
@@ -42,12 +83,37 @@
             inherit pkgs;
             image = "ubuntu2404x86_64";
           };
+          # the same with the Rust helper (the static build), installed outside /usr
+          debian12-rust = import ./tests/distro.nix {
+            inherit pkgs;
+            image = "debian12x86_64";
+            makeFlags = "PREFIX=/opt/appzones HELPER=rust HELPER_BIN=${
+              self.packages.${pkgs.stdenv.hostPlatform.system}.helper
+            }/bin/appzones-helper MOUNT_HELPER_BIN=${
+              self.packages.${pkgs.stdenv.hostPlatform.system}.mount-helper
+            }/bin/appzones-mount-helper";
+          };
+          ubuntu2404-rust = import ./tests/distro.nix {
+            inherit pkgs;
+            image = "ubuntu2404x86_64";
+            makeFlags = "PREFIX=/opt/appzones HELPER=rust HELPER_BIN=${
+              self.packages.${pkgs.stdenv.hostPlatform.system}.helper
+            }/bin/appzones-helper MOUNT_HELPER_BIN=${
+              self.packages.${pkgs.stdenv.hostPlatform.system}.mount-helper
+            }/bin/appzones-mount-helper";
+          };
         }
         // {
           # NixOS VM test (needs /dev/kvm, ~6 min)
           vm = import ./tests/vm.nix {
             inherit pkgs;
             module = self.nixosModules.default;
+          };
+          # the same VM test with the Rust helpers
+          vm-rust = import ./tests/vm.nix {
+            inherit pkgs;
+            module = self.nixosModules.default;
+            package = self.packages.${pkgs.stdenv.hostPlatform.system}.appzones-rust;
           };
         }
       );

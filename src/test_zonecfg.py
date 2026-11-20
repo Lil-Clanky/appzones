@@ -559,6 +559,71 @@ os.write(w, b"\\n"); os.close(w)
                 p.kill()
                 p.wait()
 
+    def test_helper_argv(self):
+        """Which zone-wayland runs: an explicit $APPZONES_BIN_ZONE_WAYLAND, else the Rust helper's
+        command when appzones was installed with it, else the program."""
+        zone = self._zone_mod()
+        t = Path(self.tmp.name)
+        (t / "zone-wayland").write_text("#!/bin/sh\n")
+        (t / "appzones-helper").write_text("#!/bin/sh\n[ \"$1\" = --commands ] && printf 'zone-wayland\\nzone-init\\n'\n")
+        for name in ("zone-wayland", "appzones-helper"):
+            (t / name).chmod(0o755)
+        zone.HERE = t
+        saved = {k: os.environ.pop(k, None) for k in ("APPZONES_BIN_ZONE_WAYLAND", "ZONES_BIN_ZONE_WAYLAND",
+                                                       "APPZONES_BIN_APPZONES_HELPER", "ZONES_BIN_APPZONES_HELPER",
+                                                       "PATH")}
+        (t / "empty").mkdir()
+        os.environ["PATH"] = str(t / "empty")  # nothing installed on this machine counts
+        zone.SBIN_DIRS = ()
+        try:
+            zone.HELPER = ""
+            self.assertEqual(zone.helper_argv("zone-wayland"), [str(t / "zone-wayland")])
+            zone.HELPER = "rust"
+            self.assertEqual(zone.helper_argv("zone-wayland"), [str(t / "appzones-helper"), "zone-wayland"])
+            os.environ["APPZONES_BIN_ZONE_WAYLAND"] = "/tmp/slow-zw"
+            self.assertEqual(zone.helper_argv("zone-wayland"), ["/tmp/slow-zw"])
+            (t / "appzones-helper").unlink()
+            os.environ.pop("APPZONES_BIN_ZONE_WAYLAND")
+            self.assertIsNone(zone.helper_argv("zone-wayland"))  # the Rust helper missing: not the C one
+        finally:
+            os.environ.pop("APPZONES_BIN_ZONE_WAYLAND", None)
+            os.environ.pop("PATH", None)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_zone_init_argv(self):
+        """zone-init: the host's Python and zone_init.py, or with the Rust helper the binary
+        bound read-only at /run/appzones-helper and run from there."""
+        zone = self._zone_mod()
+        t = Path(self.tmp.name)
+        (t / "appzones-helper").write_text("#!/bin/sh\n[ \"$1\" = --commands ] && printf 'zone-wayland\\nzone-init\\n'\n")
+        (t / "appzones-helper").chmod(0o755)
+        zone.HERE = t
+        zone.HELPER = ""
+        a = zone.zone_init_argv()
+        self.assertEqual(a[0], "--")
+        self.assertTrue(a[-1].endswith("zone_init.py"))
+        zone.HELPER = "rust"
+        saved = {k: os.environ.pop(k, None) for k in ("APPZONES_BIN_APPZONES_HELPER", "ZONES_BIN_APPZONES_HELPER")}
+        try:
+            self.assertEqual(zone.zone_init_argv(), ["--ro-bind", str((t / "appzones-helper").resolve()),
+                                                     "/run/appzones-helper", "--", "/run/appzones-helper",
+                                                     "zone-init"])
+            # an older helper (no zone-init) is refused before bwrap starts
+            old = t / "old-helper"
+            old.write_text("#!/bin/sh\n[ \"$1\" = --commands ] && echo zone-wayland\n")
+            old.chmod(0o755)
+            os.environ["APPZONES_BIN_APPZONES_HELPER"] = str(old)
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                zone.zone_init_argv()
+            self.assertIn("implements zone-init", err.getvalue())
+            os.environ.pop("APPZONES_BIN_APPZONES_HELPER")
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
     def test_server_by_lock(self):
         """A server is found by the zone's lock it holds, whatever its program is called (a
         Rust one too); a process that does not hold that lock is not a server."""
@@ -754,7 +819,8 @@ os.write(w, b"\\n"); os.close(w)
         self.assertEqual((fhs["XDG_DATA_DIRS"], fhs["TZDIR"]), ("/usr/local/share:/usr/share", "/usr/share/zoneinfo"))
         self.assertTrue(nix["PATH"].endswith("/run/current-system/sw/bin"))
         # the xdg-open shim: a shell every layout has, and the real xdg-open filled in
-        shim = zone.XDG_OPEN.format(links="zone", target="aa", python="/usr/bin/python3", xdg_open="/usr/bin/xdg-open")
+        shim = zone.XDG_OPEN.format(links="zone", target="aa", open_link=zone.open_link_command("/usr/bin/python3"),
+                                    xdg_open="/usr/bin/xdg-open")
         self.assertTrue(shim.startswith("#!/bin/sh\n"))
         self.assertIn('exec /usr/bin/xdg-open "$@"', shim)
         # packages without Nix: a warning, no build
@@ -824,8 +890,45 @@ os.write(w, b"\\n"); os.close(w)
         self.assertTrue(zone.propagation_shared(Path("/homeX/a"), str(info)))  # /homeX is not under /home
         self.assertIsNone(zone.propagation_shared(Path("/x"), str(info) + ".missing"))
 
+    def test_code_dir_never_bound(self):
+        """appzones' own code directory is on the never-list: a bind that is it, contains it or
+        is inside it is refused (a zone that could write it would run its code on the host)."""
+        code = self.z.CODE_DIR
+        self.assertIn(code, self.z.denied_paths())
+        for p in (code, code.parent, code / "appzones"):
+            err = self.z.policy_error(p, str(p))
+            self.assertIsNotNone(err, p)
+            self.assertIn("never enters a zone", err)
+
+    def test_open_link_command(self):
+        """The xdg-open shim's http(s) part: the Python one-liner, or the Rust helper in the zone."""
+        zone = self._zone_mod()
+        zone.HELPER = ""
+        py = zone.open_link_command("/usr/bin/python3")
+        self.assertTrue(py.startswith("/usr/bin/python3 -c "))
+        self.assertIn('b"\\n"', py)  # the shell gets \n, which Python reads as a newline
+        zone.HELPER = "rust"
+        zone.zone_helper = lambda: "/x/appzones-helper"
+        zone.implements = lambda h, c: True
+        self.assertEqual(zone.open_link_command("/usr/bin/python3"), "/run/appzones-helper open-link")
+        zone.implements = lambda h, c: c != "open-link"  # an older helper: the Python shim stays
+        self.assertTrue(zone.open_link_command("/usr/bin/python3").startswith("/usr/bin/python3 -c "))
+        zone.HELPER = ""
+
     def test_install_error(self):
-        """appzones must be installed where a zone sees it: /usr outside NixOS, /nix/store on NixOS."""
+        """appzones must be installed where a zone sees it: /usr outside NixOS, /nix/store on NixOS;
+        anywhere with the Rust helper (only the helper, bound in, runs in the zone)."""
+        zone = self._zone_mod()
+        zone.HELPER = "rust"
+        zone.zone_helper = lambda: "/x/appzones-helper"
+        zone.implements = lambda h, c: True
+        self.assertIsNone(zone.install_error(Path("/opt/appzones"), "fhs"))
+        self.assertIsNone(zone.install_error(Path("/home/u/appzones/src"), "nixos"))
+        zone.implements = lambda h, c: c != "open-link"  # the helper lacks a part: the rule stays
+        self.assertIsNotNone(zone.install_error(Path("/opt/appzones"), "fhs"))
+        zone.zone_helper = lambda: None  # installed for the Rust helper, but none is there: refused
+        for here in ("/usr/local/lib/appzones", "/opt/appzones"):  # before anything starts, also under /usr
+            self.assertIn("no appzones-helper that implements zone-init", zone.install_error(Path(here), "fhs"))
         zone = self._zone_mod()
         self.assertIsNone(zone.install_error(Path("/usr/local/lib/appzones"), "fhs"))
         self.assertIsNone(zone.install_error(Path("/nix/store/abc-appzones/libexec/appzones"), "nixos"))
@@ -1770,7 +1873,8 @@ class AgentProtocolTest(unittest.TestCase):
         cmd = shlex.split(os.environ.get("APPZONES_TEST_ZONE_INIT", "")) or [sys.executable, "-B",
                                                                                str(HERE / "zone_init.py")]
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(t), "ZONE": "tt",
-               "ZONE_CTL_FD": str(ls.fileno()), "ZONE_SERVER_FD": str(me), "XDG_RUNTIME_DIR": str(t)}
+               "ZONE_CTL_FD": str(ls.fileno()), "ZONE_SERVER_FD": str(me), "XDG_RUNTIME_DIR": str(t),
+               b"LC_TEST": b"caf\xe9"}  # not UTF-8 (a Latin-1 locale's): zone-init starts and passes it on
         self.proc = subprocess.Popen(cmd, env=env, pass_fds=(ls.fileno(), me), stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         ls.close()
@@ -1867,6 +1971,15 @@ class AgentProtocolTest(unittest.TestCase):
                          (os.open(os.devnull, os.O_RDONLY), os.open(os.devnull, os.O_WRONLY),
                           os.open(os.devnull, os.O_WRONLY)), n=2)
         self.assertEqual(r[1], {"exit": -9})
+
+    def test_environment_bytes(self):
+        """A variable that is not UTF-8 reaches a command unchanged (zone-init answered, so it started)."""
+        null = [os.open(os.devnull, os.O_RDONLY), os.open(os.devnull, os.O_WRONLY), os.open(os.devnull, os.O_WRONLY)]
+        r = self.request({"op": "run", "argv": ["sh", "-c", 'test "$LC_TEST" = "$(printf "caf\\351")"'], "wait": True},
+                         null, n=2)
+        for f in null:
+            os.close(f)
+        self.assertEqual(r[1], {"exit": 0})
 
     def test_run_wait_refuses(self):
         """--wait takes pipes, files or /dev/null, never a tty or a socket, and exactly three."""
@@ -1968,3 +2081,67 @@ class AgentProtocolTest(unittest.TestCase):
                 if p.poll() is None:
                     p.kill()
                     p.wait()
+
+
+@unittest.skipUnless(os.environ.get("APPZONES_TEST_HELPER"), "needs $APPZONES_TEST_HELPER (the Rust helper)")
+class DifferentialPolicyTest(unittest.TestCase):
+    """The never-list for runtime mounts in Rust (the root step's) is zonecfg's: both lists
+    are the same, entry by entry and in order (so an entry added on one side only fails
+    this test), and both give the same answer, with the same message, for every path here:
+    every entry, what contains it and what is inside it, symlinks to them, the system
+    trees, the host's own additions, appzones' code directory, files, a missing path."""
+
+    def test_same_answers(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        t = Path(tmp.name).resolve()
+        home = t / "home"
+        for d in ("proj/sub", ".ssh", ".local/share/opencode-x", ".local/share/opencodeish", ".claude", ".claude-2",
+                  "Secrets/inner", "data", ".config", ".local/state/appzones"):
+            (home / d).mkdir(parents=True, exist_ok=True)
+        (home / "file").write_text("x")
+        (home / "ssh-link").symlink_to(home / ".ssh")
+        (home / "proj-link").symlink_to(home / "proj")
+        (home / "dangling").symlink_to(t / "nowhere")
+        srv = t / "srv/code"
+        srv.mkdir(parents=True)
+        denied = t / "denied-paths"
+        denied.write_text(f"# the host's own\n~/Secrets\n{srv}   # code\n\n")
+        saved = {k: os.environ.get(k) for k in ("APPZONES_HOME_FOR_TESTS", "APPZONES_DENIED_PATHS", "XDG_STATE_HOME")}
+        os.environ["APPZONES_HOME_FOR_TESTS"] = str(home)
+        os.environ["APPZONES_DENIED_PATHS"] = str(denied)
+        os.environ.pop("XDG_STATE_HOME", None)
+        try:
+            sys.path.insert(0, str(HERE))
+            import zonecfg
+            z = importlib.reload(zonecfg)
+            paths = ["~/proj", "~/proj/sub", str(home / "proj"), "~/proj-link", "~/ssh-link", "~/dangling", "~/file",
+                     "~/missing", "relative/path", "~", str(home), str(home.parent), "/", "/home", "/etc", "/etc/ssh",
+                     "/nix", "/nix/store", "/tmp", "/var/tmp", "/run", "/proc/1", "/usr", "/usr/share", "/boot",
+                     "/root", str(srv), str(srv.parent), str(srv / "x"), "~/Secrets", "~/Secrets/inner", "~/data",
+                     "~/.config", "~//proj/./sub/", str(z.CODE_DIR), str(z.CODE_DIR.parent), str(z.CODE_DIR / "appzones"),
+                     "~/.local/state", "~/.local/share", str(t)]
+            for d in z.denied_paths():  # every entry, what contains it, what is inside it
+                d = Path(d)
+                if d.is_relative_to(home):
+                    (d / "inner").mkdir(parents=True, exist_ok=True)
+                paths += [str(d), str(d.parent), str(d / "inner")]
+            want = [z.mount_source_error(p) for p in paths]
+            want_list = [str(d) for d in z.denied_paths()]
+        finally:
+            sys.path.remove(str(HERE))
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        out = subprocess.run([os.environ["APPZONES_TEST_HELPER"], "check-mount-source", "--home", str(home),
+                              "--code-dir", str(z.CODE_DIR), "--denied-file", str(denied), "--list-denied", *paths],
+                             capture_output=True, text=True, check=True).stdout.removesuffix("\n").split("\n")
+        self.assertEqual(json.loads(out[0]), want_list)
+        got = [json.loads(line) for line in out[1:]]
+        self.assertEqual(len(got), len(paths))
+        diffs = [(p, w, g) for p, w, g in zip(paths, want, got) if w != g]
+        self.assertEqual(diffs, [], "\n".join(f"{p}:\n  python: {w}\n  rust:   {g}" for p, w, g in diffs))
+        self.assertGreater(sum(w is None for w in want), 3)  # some allowed, too
+        self.assertGreater(sum(w is not None for w in want), 30)

@@ -14,7 +14,9 @@ systemd --user: appzones@work.service   (appzones.slice, Type=notify;
       │                   socket, then exec)
       └─ bwrap (user, pid, ipc, uts, cgroup ns; no caps; no_new_privs)
          └─ zone-init     the agent inside: run, shell (pty), ps (its protocol: the
-                          top of src/zone_init.py, tested by AgentProtocolTest)
+                          top of src/zone_init.py, tested by AgentProtocolTest; with
+                          the Rust helper, appzones-helper zone-init, bound read-only
+                          at /run/appzones-helper)
             └─ apps
 ```
 
@@ -55,7 +57,9 @@ systemd --user: appzones@work.service   (appzones.slice, Type=notify;
 - The zone ends with its server, however the server ends (also `kill -9`):
   zone-init holds a pidfd of the server (handed over a unix socket, since
   pasta closes inherited fds) and ends the zone when it becomes readable;
-  zone-wayland gets SIGTERM when the server dies (`PR_SET_PDEATHSIG`); the
+  zone-wayland (the C helper, or `appzones-helper zone-wayland` when appzones
+  was installed with the Rust helper: the `appzones-rust` package or `make
+  install HELPER=rust`, which set `APPZONES_HELPER=rust`) gets SIGTERM when the server dies (`PR_SET_PDEATHSIG`); the
   D-Bus proxy is tied the same way. Waiting for zone-wayland's "ready", the
   proxy's bus, the pidfd hand-over and zone-init's answer each have a deadline
   (`start_timeout`, 30 seconds by default); building `packages` comes before
@@ -67,7 +71,8 @@ systemd --user: appzones@work.service   (appzones.slice, Type=notify;
   `$XDG_RUNTIME_DIR/appzones/NAME/agent.sock`, outside the zone. zone-init
   gets it as an inherited fd; there is no socket file inside the zone. zone-init
   is not dumpable, so apps in the zone cannot trace it or take that fd.
-- `/run/zone` inside is read-only: the `xdg-open` shim (`bin/`) and the
+- `/run/zone` inside is read-only: the `xdg-open` shim (`bin/`; its link part
+  is a Python one-liner, or `appzones-helper open-link` with the Rust helper) and the
   host's `links.sock`, through which clicked links leave the zone, and
   `dns.sock`, through which DNS queries do.
 - DNS (`network = "internet"`): the zone's `resolv.conf` names `127.0.0.53`,

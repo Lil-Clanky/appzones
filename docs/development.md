@@ -11,6 +11,8 @@ just build          # the package (runs the unit tests too)
 just test-vm        # NixOS VM: Hyprland, zone units, isolation, window tags (~6 min, /dev/kvm)
 just test-install   # `make install` into a staging directory (for other distributions)
 just test-distros   # Ubuntu 24.04 and Debian 12 in a VM: make install, zones as a user (~3 min each)
+just test-rust      # the Rust helpers (helper/, design/rust.md): cargo test, protocol, never-list, VM, distros
+just audit          # the Rust helpers' dependencies (cargo deny: advisories, licenses; needs the network)
 ```
 
 The VM test (`tests/vm.nix`, `checks.x86_64-linux.vm`) runs Hyprland on a
