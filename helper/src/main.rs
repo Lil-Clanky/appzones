@@ -20,21 +20,33 @@ mod agent;
 mod cli;
 mod config;
 mod host_dns;
+#[cfg(target_os = "linux")]
 mod netsetup;
 mod open_link;
+// (on macOS only partly used until zones run there: design/macos.md, stage 2)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod plan;
 mod policy;
 mod pyfmt;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod serve;
+mod sys;
+// what runs in a zone and beside it on Linux; zone-init comes to macOS in stage 2
+#[cfg(target_os = "linux")]
 mod zone_dns;
+#[cfg(target_os = "linux")]
 mod zone_init;
+#[cfg(target_os = "linux")]
 mod zone_wayland;
 
 const USAGE: &str = "usage: appzones-helper cli ARGS... | zone-init | open-link URL | zone-wayland SOCKET APP_ID INSTANCE | \
                      plan ZONE | serve --plan FILE --lock-fd L [--notify-fd N] | --version | --commands";
 
 /// The commands this build implements (`--commands`).
+#[cfg(target_os = "linux")]
 const IMPLEMENTED: &[&str] = &["zone-wayland", "zone-init", "open-link", "serve", "plan", "cli"];
+#[cfg(not(target_os = "linux"))]
+const IMPLEMENTED: &[&str] = &["open-link", "cli"];
 
 fn main() -> ExitCode {
     // never a panic on an argument that is not UTF-8 (std::env::args would): lossy here,
@@ -52,9 +64,11 @@ fn main() -> ExitCode {
         // SIGTERM), never a negative clamped to success
         return ExitCode::from((cli::main(&raw[1..]) & 0xff) as u8);
     }
+    #[cfg(target_os = "linux")]
     if raw.first().map(|a| a == "plan").unwrap_or(false) {
         return ExitCode::from(plan::plan_main(&raw[1..])); // a zone's plan, as appzones serve's first part
     }
+    #[cfg(target_os = "linux")]
     if raw.first().map(|a| a == "serve").unwrap_or(false) {
         return ExitCode::from(serve::main(&raw[1..])); // the plan's path byte for byte
     }
@@ -72,7 +86,9 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        #[cfg(target_os = "linux")]
         Some("zone-wayland") => ExitCode::from(zone_wayland::main(&args[1..])),
+        #[cfg(target_os = "linux")]
         Some("zone-init") => ExitCode::from(zone_init::main(&args[1..])),
         Some("open-link") => ExitCode::from(open_link::main(&args[1..])),
         _ => {

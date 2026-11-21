@@ -329,9 +329,7 @@ fn theme_source_error(policy: &Policy, real: &[u8]) -> Option<String> {
 
 /// fd_path as the kernel gives it, byte for byte.
 fn fd_path_bytes(fd: i32) -> Option<Vec<u8>> {
-    let t = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
-    let t = t.as_os_str().as_bytes().to_vec();
-    (!t.ends_with(b" (deleted)") && t.starts_with(b"/")).then_some(t)
+    crate::sys::fd_path(fd)
 }
 
 struct Budget;
@@ -521,7 +519,7 @@ fn usb_binds_in(ids: &[String], root: &str) -> (Vec<String>, Vec<String>) {
             continue;
         };
         let rdev = st.rdev();
-        let mm = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+        let mm = crate::sys::major_minor(rdev);
         if !majmin.is_empty() && mm != majmin {
             warn(&format!("usb: {node} is not {vid}:{pid} ({e}); skipped"));
             continue;
@@ -1367,6 +1365,13 @@ fn selinux_problem(pasta: &str) -> Option<String> {
 }
 
 /// The SELinux label of the file at PATH.
+#[cfg(not(target_os = "linux"))]
+fn selinux_label(_: &str) -> Option<String> {
+    None // (no SELinux)
+}
+
+/// The SELinux label of the file at PATH.
+#[cfg(target_os = "linux")]
 fn selinux_label(path: &str) -> Option<String> {
     let c = std::ffi::CString::new(path.as_bytes()).ok()?;
     let mut buf = vec![0u8; 256];
@@ -1568,10 +1573,14 @@ mod tests {
         std::fs::write(h.join(".gitconfig.new"), "new").unwrap();
         std::fs::rename(h.join(".gitconfig.new"), &secret).unwrap(); // an atomic save
         assert_eq!(fd_path_bytes(f.as_raw_fd()), None);
-        // an O_PATH descriptor of a directory removed after it was opened
+        // a descriptor of a directory removed after it was opened (O_PATH on Linux)
         let d = h.join("Docs/gone");
         std::fs::create_dir(&d).unwrap();
-        let g = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH).open(&d).unwrap();
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::O_DIRECTORY;
+        let g = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(&d).unwrap();
         std::fs::remove_dir(&d).unwrap();
         assert_eq!(fd_path_bytes(g.as_raw_fd()), None);
         let _ = std::fs::remove_dir_all(&t);
