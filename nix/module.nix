@@ -52,7 +52,8 @@ in
     };
 
     deniedPaths = lib.mkOption {
-      type = lib.types.listOf (lib.types.strMatching "(/|~/).*");
+      # (only what /etc/appzones/denied-paths gives back unchanged: nix/denied-path.nix)
+      type = lib.types.listOf (import ./denied-path.nix lib);
       default = [ ];
       example = [
         "/srv/code"
